@@ -1,0 +1,7 @@
+{
+  "name": "Classroom Quiz Server",
+  "description": "Offline classroom quiz and activity server hosted over Wi-Fi hotspot without internet.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
