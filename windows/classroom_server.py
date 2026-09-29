@@ -3,6 +3,7 @@
 """
 Classroom Quiz Server - Windows 11 Desktop Edition
 خادم بث الاختبارات المدرسية المباشر عبر شبكة الواي فاي المحلية
+يدعم تسجيل المعلم، تسجيل الطلاب وتحديد المرحلة والشعبة، تخصيص وتعديل الاختبارات، والتشفير
 """
 
 import http.server
@@ -32,7 +33,7 @@ def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
 
-    # Settings table
+    # 1. Settings table
     c.execute('''
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -42,6 +43,9 @@ def init_db():
     defaults = [
         ("session_open", "1"),
         ("grades_globally_visible", "1"),
+        ("teacher_setup_completed", "0"),
+        ("teacher_password", ""),
+        ("teacher_username", "admin"),
         ("teacher_name", "الأستاذ / المعلم"),
         ("teacher_subject", "المادة التعليمية"),
         ("teacher_phone", ""),
@@ -51,7 +55,7 @@ def init_db():
     for k, v in defaults:
         c.execute('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)', (k, v))
 
-    # Logs table
+    # 2. Logs table
     c.execute('''
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,13 +66,15 @@ def init_db():
         )
     ''')
 
-    # Students table
+    # 3. Students table
     c.execute('''
         CREATE TABLE IF NOT EXISTS students (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE COLLATE NOCASE,
             nationalId TEXT DEFAULT '',
             phone TEXT DEFAULT '',
+            grade TEXT DEFAULT '',
+            section TEXT DEFAULT '',
             gradeSection TEXT DEFAULT '',
             password TEXT DEFAULT '',
             notes TEXT DEFAULT '',
@@ -82,20 +88,22 @@ def init_db():
         )
     ''')
 
-    # Quizzes table
+    # 4. Quizzes table
     c.execute('''
         CREATE TABLE IF NOT EXISTS quizzes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             description TEXT DEFAULT '',
             durationMinutes INTEGER DEFAULT 10,
+            targetGrade TEXT DEFAULT 'الكل',
+            targetSection TEXT DEFAULT 'الكل',
             isActive INTEGER DEFAULT 1,
             type TEXT DEFAULT 'QUIZ',
             createdAt INTEGER
         )
     ''')
 
-    # Questions table
+    # 5. Questions table
     c.execute('''
         CREATE TABLE IF NOT EXISTS questions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +120,7 @@ def init_db():
         )
     ''')
 
-    # Submissions table
+    # 6. Submissions table
     c.execute('''
         CREATE TABLE IF NOT EXISTS submissions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,13 +134,28 @@ def init_db():
         )
     ''')
 
+    # Migration for existing databases
+    c.execute("PRAGMA table_info(students)")
+    st_cols = [r[1] for r in c.fetchall()]
+    if 'grade' not in st_cols:
+        c.execute("ALTER TABLE students ADD COLUMN grade TEXT DEFAULT ''")
+    if 'section' not in st_cols:
+        c.execute("ALTER TABLE students ADD COLUMN section TEXT DEFAULT ''")
+
+    c.execute("PRAGMA table_info(quizzes)")
+    qz_cols = [r[1] for r in c.fetchall()]
+    if 'targetGrade' not in qz_cols:
+        c.execute("ALTER TABLE quizzes ADD COLUMN targetGrade TEXT DEFAULT 'الكل'")
+    if 'targetSection' not in qz_cols:
+        c.execute("ALTER TABLE quizzes ADD COLUMN targetSection TEXT DEFAULT 'الكل'")
+
     # Seed initial starter quiz if database is new
     c.execute('SELECT COUNT(*) FROM quizzes')
     if c.fetchone()[0] == 0:
         now = int(time.time() * 1000)
         c.execute('''
-            INSERT INTO quizzes (title, description, durationMinutes, isActive, type, createdAt)
-            VALUES (?, ?, ?, 1, 'QUIZ', ?)
+            INSERT INTO quizzes (title, description, durationMinutes, targetGrade, targetSection, isActive, type, createdAt)
+            VALUES (?, ?, ?, 'الكل', 'الكل', 1, 'QUIZ', ?)
         ''', ("اختبار مراجعة الحصة الأول", "اختبار قصير للتأكد من استيعاب المفاهيم الأساسية", 5, now))
         qid = c.lastrowid
         questions = [
@@ -207,7 +230,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
     def send_cors_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, Authorization')
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -258,7 +281,21 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # 4. GET /api/quizzes
+        # 4. GET /api/teacher/auth-status
+        if path == '/api/teacher/auth-status':
+            is_setup = (get_setting("teacher_setup_completed", "0") == "1")
+            pwd = get_setting("teacher_password", "")
+            # If password is empty, setup is not done
+            has_password = bool(pwd and pwd.strip())
+            self.send_json(200, {
+                "isSetup": is_setup and has_password,
+                "teacherName": get_setting("teacher_name", "الأستاذ / المعلم"),
+                "teacherSubject": get_setting("teacher_subject", "المادة التعليمية"),
+                "teacherUsername": get_setting("teacher_username", "")
+            })
+            return
+
+        # 5. GET /api/quizzes
         if path == '/api/quizzes':
             conn = sqlite3.connect(DB_FILE)
             conn.row_factory = sqlite3.Row
@@ -272,7 +309,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, quizzes)
             return
 
-        # 5. GET /api/quiz?id=X&student=Y
+        # 6. GET /api/quiz?id=X&student=Y
         if path == '/api/quiz':
             qid = query.get('id', [None])[0]
             student = query.get('student', [''])[0].strip()
@@ -309,15 +346,33 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"quiz": dict(quiz_row), "questions": questions})
             return
 
-        # 6. GET /api/student-quizzes?student=X
+        # 7. GET /api/student-quizzes?student=X
         if path == '/api/student-quizzes':
             student = query.get('student', [''])[0].strip()
             conn = sqlite3.connect(DB_FILE)
             conn.row_factory = sqlite3.Row
             c = conn.cursor()
 
+            c.execute('SELECT * FROM students WHERE LOWER(TRIM(username)) = LOWER(TRIM(?)) LIMIT 1', (student,))
+            srow = c.fetchone()
+            sdict = dict(srow) if srow else {}
+            st_grade = sdict.get('grade', '').strip()
+            st_sec = sdict.get('section', '').strip()
+
             c.execute('SELECT * FROM quizzes WHERE isActive = 1 ORDER BY createdAt DESC')
-            active_quizzes = [dict(r) for r in c.fetchall()]
+            all_active = [dict(r) for r in c.fetchall()]
+
+            # Target Grade and Section Filtering
+            targeted_quizzes = []
+            for q in all_active:
+                t_grade = (q.get('targetGrade') or 'الكل').strip()
+                t_sec = (q.get('targetSection') or 'الكل').strip()
+
+                grade_match = (t_grade == 'الكل' or not st_grade or t_grade == st_grade)
+                sec_match = (t_sec == 'الكل' or not st_sec or t_sec == st_sec)
+
+                if grade_match and sec_match:
+                    targeted_quizzes.append(q)
 
             submitted_qids = set()
             completed = []
@@ -333,13 +388,9 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                     s_dict['percentage'] = pct
                     completed.append(s_dict)
 
-            unattempted = [q for q in active_quizzes if q['id'] not in submitted_qids]
+            unattempted = [q for q in targeted_quizzes if q['id'] not in submitted_qids]
 
             glob_visible = (get_setting("grades_globally_visible", "1") == "1")
-            c.execute('SELECT * FROM students WHERE LOWER(TRIM(username)) = LOWER(TRIM(?)) LIMIT 1', (student,))
-            srow = c.fetchone()
-            sdict = dict(srow) if srow else {}
-
             effective_visible = glob_visible and (sdict.get('showGradesToStudent', 1) == 1)
             total = (sdict.get('exam1Score', 0) or 0) + (sdict.get('exam2Score', 0) or 0) + (sdict.get('participationScore', 0) or 0) + (sdict.get('bonusScore', 0) or 0)
 
@@ -352,6 +403,8 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                 "totalScore": round(total, 1),
                 "notes": sdict.get('notes', '') if (effective_visible and sdict.get('showNotesToStudent', 1) == 1) else "",
                 "hasNotes": bool(sdict.get('notes')),
+                "grade": sdict.get('grade', ''),
+                "section": sdict.get('section', ''),
                 "gradeSection": sdict.get('gradeSection', '')
             }
 
@@ -363,7 +416,69 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # 7. GET /api/teacher/data - Live Feed for Teacher Console
+        # 8. GET /api/teacher/quiz-detail?id=X
+        if path == '/api/teacher/quiz-detail':
+            qid = query.get('id', [None])[0]
+            if not qid:
+                self.send_json(400, {"message": "رقم الاختبار مطلوب"})
+                return
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute('SELECT * FROM quizzes WHERE id = ?', (qid,))
+            q_row = c.fetchone()
+            if not q_row:
+                conn.close()
+                self.send_json(404, {"message": "الاختبار غير موجود"})
+                return
+            c.execute('SELECT * FROM questions WHERE quizId = ? ORDER BY id ASC', (qid,))
+            questions = [dict(r) for r in c.fetchall()]
+            conn.close()
+            self.send_json(200, {"quiz": dict(q_row), "questions": questions})
+            return
+
+        # 9. GET /api/teacher/quiz-submissions?id=X
+        if path == '/api/teacher/quiz-submissions':
+            qid = query.get('id', [None])[0]
+            if not qid:
+                self.send_json(400, {"message": "رقم الاختبار مطلوب"})
+                return
+            conn = sqlite3.connect(DB_FILE)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute('SELECT * FROM quizzes WHERE id = ?', (qid,))
+            q_row = c.fetchone()
+            if not q_row:
+                conn.close()
+                self.send_json(404, {"message": "الاختبار غير موجود"})
+                return
+
+            c.execute('SELECT * FROM questions WHERE quizId = ? ORDER BY id ASC', (qid,))
+            questions = [dict(r) for r in c.fetchall()]
+
+            c.execute('''
+                SELECT sub.*, st.grade, st.section, st.gradeSection, st.nationalId
+                FROM submissions sub
+                LEFT JOIN students st ON LOWER(TRIM(sub.studentUsername)) = LOWER(TRIM(st.username))
+                WHERE sub.quizId = ?
+                ORDER BY sub.submittedAt DESC
+            ''', (qid,))
+            subs = [dict(r) for r in c.fetchall()]
+            for s in subs:
+                try:
+                    s['answers'] = json.loads(s.get('answersJson') or '{}')
+                except Exception:
+                    s['answers'] = {}
+
+            conn.close()
+            self.send_json(200, {
+                "quiz": dict(q_row),
+                "questions": questions,
+                "submissions": subs
+            })
+            return
+
+        # 10. GET /api/teacher/data - Live Feed for Teacher Console
         if path == '/api/teacher/data':
             conn = sqlite3.connect(DB_FILE)
             conn.row_factory = sqlite3.Row
@@ -379,9 +494,11 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             for q in quizzes:
                 c.execute('SELECT COUNT(*) FROM questions WHERE quizId = ?', (q['id'],))
                 q['questionCount'] = c.fetchone()[0]
+                c.execute('SELECT COUNT(*) FROM submissions WHERE quizId = ?', (q['id'],))
+                q['submissionsCount'] = c.fetchone()[0]
 
             c.execute('''
-                SELECT s.*, q.title as quizTitle, q.type as quizType
+                SELECT s.*, q.title as quizTitle, q.type as quizType, q.targetGrade, q.targetSection
                 FROM submissions s
                 LEFT JOIN quizzes q ON s.quizId = q.id
                 ORDER BY s.submittedAt DESC
@@ -416,7 +533,74 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
         data = json.loads(body) if body else {}
         path = urllib.parse.urlparse(self.path).path
 
-        # 1. POST /api/status - Open/Close Session
+        # 1. POST /api/teacher/setup - First launch setup
+        if path == '/api/teacher/setup':
+            name = data.get('name', '').strip()
+            password = data.get('password', '').strip()
+            username = data.get('username', '').strip() or 'admin'
+            phone = data.get('phone', '').strip()
+            subject = data.get('subject', '').strip() or 'المادة التعليمية'
+
+            if not name:
+                self.send_json(400, {"success": False, "message": "اسم الأستاذ إجباري"})
+                return
+            if not password:
+                self.send_json(400, {"success": False, "message": "كلمة المرور إجبارية لحماية لوحة التحكم"})
+                return
+
+            set_setting("teacher_name", name)
+            set_setting("teacher_password", password)
+            set_setting("teacher_username", username)
+            set_setting("teacher_phone", phone)
+            set_setting("teacher_subject", subject)
+            set_setting("teacher_setup_completed", "1")
+
+            add_log("SYSTEM", f"تم إعداد حساب الأستاذ ({name}) وحماية لوحة التحكم بكلمة مرور بنجاح")
+            self.send_json(200, {
+                "success": True,
+                "message": "تم إعداد الحساب بنجاح",
+                "teacher": {
+                    "name": name,
+                    "username": username,
+                    "subject": subject,
+                    "phone": phone
+                }
+            })
+            return
+
+        # 2. POST /api/teacher/login - Teacher Login
+        if path == '/api/teacher/login':
+            password = data.get('password', '').strip()
+            username = data.get('username', '').strip()
+            stored_pwd = get_setting("teacher_password", "")
+            stored_user = get_setting("teacher_username", "")
+
+            if not stored_pwd:
+                # Setup not completed yet
+                self.send_json(400, {"success": False, "needSetup": True, "message": "يجب إعداد حساب الأستاذ أولاً"})
+                return
+
+            # If username was specified, verify it if stored is present
+            if username and stored_user and username.lower() != stored_user.lower():
+                self.send_json(401, {"success": False, "message": "اسم المستخدم أو كلمة المرور غير صحيحة"})
+                return
+
+            if password != stored_pwd:
+                self.send_json(401, {"success": False, "message": "كلمة المرور غير صحيحة"})
+                return
+
+            add_log("SYSTEM", f"تم تسجيل دخول المعلم: {get_setting('teacher_name', 'الأستاذ')}")
+            self.send_json(200, {
+                "success": True,
+                "teacher": {
+                    "name": get_setting("teacher_name", "الأستاذ"),
+                    "subject": get_setting("teacher_subject", ""),
+                    "username": stored_user
+                }
+            })
+            return
+
+        # 3. POST /api/status - Open/Close Session
         if path == '/api/status':
             is_open = bool(data.get('isOpen', True))
             set_setting("session_open", "1" if is_open else "0")
@@ -424,37 +608,65 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True, "isOpen": is_open})
             return
 
-        # 2. POST /api/register - Student Register
+        # 4. POST /api/register - Student Register (With Grade and Section)
         if path == '/api/register':
             username = data.get('username', '').strip()
             password = data.get('password', '').strip()
-            grade_sec = data.get('gradeSection', '').strip()
+            grade = data.get('grade', '').strip()
+            section = data.get('section', '').strip()
             nid = data.get('nationalId', '').strip()
             phone = data.get('phone', '').strip()
 
-            if not username or not password:
-                self.send_json(400, {"success": False, "message": "الاسم الرباعي وكلمة المرور مطلوبة"})
+            if not username:
+                self.send_json(400, {"success": False, "message": "الاسم الرباعي إجباري"})
                 return
+            if not password:
+                self.send_json(400, {"success": False, "message": "كلمة المرور إجبارية"})
+                return
+            if not grade or not section:
+                # If combined gradeSection is passed
+                combo = data.get('gradeSection', '').strip()
+                if combo:
+                    parts = [p.strip() for p in combo.split('-')]
+                    grade = parts[0] if parts else grade
+                    section = parts[1] if len(parts) > 1 else section
+
+            if not grade:
+                grade = "أول ثانوي"
+            if not section:
+                section = "شعبة 1"
+
+            grade_sec = f"{grade} - {section}"
 
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
             try:
                 now = int(time.time() * 1000)
                 c.execute('''
-                    INSERT INTO students (username, nationalId, phone, gradeSection, password, createdAt)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (username, nid, phone, grade_sec, password, now))
+                    INSERT INTO students (username, nationalId, phone, grade, section, gradeSection, password, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (username, nid, phone, grade, section, grade_sec, password, now))
                 sid = c.lastrowid
                 add_log_direct(c, "STUDENT_JOIN", f"طالب جديد سجل في الفصل: {username} ({grade_sec})")
                 conn.commit()
                 conn.close()
-                self.send_json(200, {"success": True, "student": {"id": sid, "username": username, "gradeSection": grade_sec, "nationalId": nid}})
+                self.send_json(200, {
+                    "success": True,
+                    "student": {
+                        "id": sid,
+                        "username": username,
+                        "grade": grade,
+                        "section": section,
+                        "gradeSection": grade_sec,
+                        "nationalId": nid
+                    }
+                })
             except sqlite3.IntegrityError:
                 conn.close()
                 self.send_json(400, {"success": False, "message": "هذا الاسم مسجل مسبقاً! انتقل لتبويب تسجيل الدخول."})
             return
 
-        # 3. POST /api/login - Student Login
+        # 5. POST /api/login - Student Login
         if path == '/api/login':
             identity = (data.get('identity') or data.get('username') or '').strip()
             password = data.get('password', '').strip()
@@ -470,19 +682,26 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             row = c.fetchone()
             if not row or row['password'] != password:
                 conn.close()
-                self.send_json(401, {"success": False, "message": "بيانات الدخول غير صحيحة"})
+                self.send_json(401, {"success": False, "message": "بيانات الدخول غير صحيحة، تأكد من الاسم أو كلمة المرور"})
                 return
 
-            add_log_direct(c, "STUDENT_JOIN", f"تسجيل دخول الطالب: {row['username']}")
+            add_log_direct(c, "STUDENT_JOIN", f"تسجيل دخول الطالب: {row['username']} ({row['gradeSection'] or (row['grade'] + ' - ' + row['section'])})")
             conn.commit()
             conn.close()
             self.send_json(200, {
                 "success": True,
-                "student": {"id": row['id'], "username": row['username'], "gradeSection": row['gradeSection'], "nationalId": row['nationalId']}
+                "student": {
+                    "id": row['id'],
+                    "username": row['username'],
+                    "grade": row['grade'],
+                    "section": row['section'],
+                    "gradeSection": row['gradeSection'] or f"{row['grade']} - {row['section']}",
+                    "nationalId": row['nationalId']
+                }
             })
             return
 
-        # 4. POST /api/submit - Submit Quiz Answers
+        # 6. POST /api/submit - Submit Quiz Answers
         if path == '/api/submit':
             qid = data.get('quizId')
             username = data.get('studentUsername', '').strip()
@@ -527,7 +746,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True, "score": score, "totalPoints": total_points, "percentage": pct})
             return
 
-        # 5. POST /api/cheat-alert - Anti-Cheat Flag
+        # 7. POST /api/cheat-alert - Anti-Cheat Flag
         if path == '/api/cheat-alert':
             st_name = data.get('student', 'طالب')
             reason = data.get('reason', 'محاولة استخدام إنترنت خارجي')
@@ -535,7 +754,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True})
             return
 
-        # 6. POST /api/teacher/evaluate - Record Grades & Notes
+        # 8. POST /api/teacher/evaluate - Record Grades & Notes
         if path == '/api/teacher/evaluate':
             sid = data.get('studentId')
             conn = sqlite3.connect(DB_FILE)
@@ -549,7 +768,9 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                     notes = ?,
                     showGradesToStudent = ?,
                     showNotesToStudent = ?,
-                    gradeSection = CASE WHEN ? != '' THEN ? ELSE gradeSection END
+                    gradeSection = CASE WHEN ? != '' THEN ? ELSE gradeSection END,
+                    grade = CASE WHEN ? != '' THEN ? ELSE grade END,
+                    section = CASE WHEN ? != '' THEN ? ELSE section END
                 WHERE id = ?
             ''', (
                 data.get('exam1', 0.0),
@@ -561,6 +782,10 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                 1 if data.get('showNotes', True) else 0,
                 data.get('gradeSection', ''),
                 data.get('gradeSection', ''),
+                data.get('grade', ''),
+                data.get('grade', ''),
+                data.get('section', ''),
+                data.get('section', ''),
                 sid
             ))
             add_log_direct(c, "SYSTEM", f"تم تحديث ورصد درجات الطالب رقم #{sid}")
@@ -569,7 +794,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True})
             return
 
-        # 7. POST /api/teacher/bonus - Quick +/- Points
+        # 9. POST /api/teacher/bonus - Quick +/- Points
         if path == '/api/teacher/bonus':
             sid = data.get('studentId')
             delta = data.get('delta', 0.0)
@@ -586,20 +811,23 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True})
             return
 
-        # 8. POST /api/teacher/settings - Update Teacher Profile & Anti-Cheat
+        # 10. POST /api/teacher/settings - Update Teacher Profile & Anti-Cheat
         if path == '/api/teacher/settings':
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
-            for k in ['teacher_name', 'teacher_subject', 'teacher_phone', 'anti_cheat', 'prevent_retake']:
+            for k in ['teacher_name', 'teacher_subject', 'teacher_phone', 'teacher_username', 'anti_cheat', 'prevent_retake']:
                 if k in data:
                     c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (k, str(data[k])))
+            new_pwd = data.get('teacher_password', '').strip()
+            if new_pwd:
+                c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES ("teacher_password", ?)', (new_pwd,))
             add_log_direct(c, "SYSTEM", "تم تحديث إعدادات المعلم وخيارات الأمان")
             conn.commit()
             conn.close()
             self.send_json(200, {"success": True})
             return
 
-        # 9. POST /api/teacher/toggle-visibility - Global Grades Visibility
+        # 11. POST /api/teacher/toggle-visibility - Global Grades Visibility
         if path == '/api/teacher/toggle-visibility':
             vis = 1 if data.get('visible', True) else 0
             conn = sqlite3.connect(DB_FILE)
@@ -612,21 +840,23 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True, "visible": bool(vis)})
             return
 
-        # 10. POST /api/teacher/create-quiz - Create Quiz
+        # 12. POST /api/teacher/create-quiz - Create Quiz With Targeting
         if path == '/api/teacher/create-quiz':
             title = data.get('title', 'اختبار').strip()
             desc = data.get('description', '').strip()
             duration = int(data.get('durationMinutes', 10))
             q_type = data.get('type', 'QUIZ')
+            target_grade = data.get('targetGrade', 'الكل').strip() or 'الكل'
+            target_sec = data.get('targetSection', 'الكل').strip() or 'الكل'
             questions = data.get('questions', [])
 
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
             now = int(time.time() * 1000)
             c.execute('''
-                INSERT INTO quizzes (title, description, durationMinutes, isActive, type, createdAt)
-                VALUES (?, ?, ?, 1, ?, ?)
-            ''', (title, desc, duration, q_type, now))
+                INSERT INTO quizzes (title, description, durationMinutes, targetGrade, targetSection, isActive, type, createdAt)
+                VALUES (?, ?, ?, ?, ?, 1, ?, ?)
+            ''', (title, desc, duration, target_grade, target_sec, q_type, now))
             new_qid = c.lastrowid
 
             q_records = [
@@ -640,13 +870,56 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', q_records)
 
-            add_log_direct(c, "SYSTEM", f"تم إنشاء اختبار جديد: {title} ({len(questions)} سؤال)")
+            add_log_direct(c, "SYSTEM", f"تم إنشاء اختبار جديد: {title} ({target_grade} - {target_sec}) - {len(questions)} سؤال")
             conn.commit()
             conn.close()
             self.send_json(200, {"success": True, "quizId": new_qid})
             return
 
-        # 11. POST /api/teacher/toggle-quiz - Toggle Quiz Active
+        # 13. POST /api/teacher/update-quiz - Edit Quiz & Questions
+        if path == '/api/teacher/update-quiz':
+            qid = data.get('quizId')
+            title = data.get('title', 'اختبار').strip()
+            desc = data.get('description', '').strip()
+            duration = int(data.get('durationMinutes', 10))
+            q_type = data.get('type', 'QUIZ')
+            target_grade = data.get('targetGrade', 'الكل').strip() or 'الكل'
+            target_sec = data.get('targetSection', 'الكل').strip() or 'الكل'
+            questions = data.get('questions', [])
+
+            if not qid:
+                self.send_json(400, {"success": False, "message": "رقم الاختبار مطلوب للتعديل"})
+                return
+
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute('''
+                UPDATE quizzes SET
+                    title = ?, description = ?, durationMinutes = ?,
+                    targetGrade = ?, targetSection = ?, type = ?
+                WHERE id = ?
+            ''', (title, desc, duration, target_grade, target_sec, q_type, qid))
+
+            # Replace questions
+            c.execute('DELETE FROM questions WHERE quizId = ?', (qid,))
+            q_records = [
+                (qid, q.get('questionText', ''), q.get('questionType', 'MULTIPLE_CHOICE'),
+                 q.get('optionA', ''), q.get('optionB', ''), q.get('optionC', ''), q.get('optionD', ''),
+                 q.get('correctAnswer', 'A'), q.get('points', 1))
+                for q in questions
+            ]
+            c.executemany('''
+                INSERT INTO questions (quizId, questionText, questionType, optionA, optionB, optionC, optionD, correctAnswer, points)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', q_records)
+
+            add_log_direct(c, "SYSTEM", f"تم تعديل وحفظ الاختبار #{qid}: {title} ({target_grade} - {target_sec})")
+            conn.commit()
+            conn.close()
+            self.send_json(200, {"success": True, "quizId": qid})
+            return
+
+        # 14. POST /api/teacher/toggle-quiz - Toggle Quiz Active
         if path == '/api/teacher/toggle-quiz':
             qid = data.get('quizId')
             is_act = 1 if data.get('isActive') else 0
@@ -662,7 +935,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True})
             return
 
-        # 12. POST /api/teacher/export-data - Encrypted Export (AES-256) [Feature 3A]
+        # 15. POST /api/teacher/export-data - Encrypted Export (AES-256)
         if path == '/api/teacher/export-data':
             password = data.get('password', '')
             conn = sqlite3.connect(DB_FILE)
@@ -681,7 +954,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        # 13. POST /api/teacher/import-data - Encrypted Import (AES-256) [Feature 3B]
+        # 16. POST /api/teacher/import-data - Encrypted Import (AES-256)
         if path == '/api/teacher/import-data':
             encrypted_code = data.get('encryptedCode', '').strip()
             password = data.get('password', '')
@@ -703,6 +976,12 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                 if not uname:
                     continue
 
+                gr = s.get('grade', '').strip()
+                sec = s.get('section', '').strip()
+                gr_sec = s.get('gradeSection', '').strip()
+                if not gr_sec and (gr or sec):
+                    gr_sec = f"{gr} - {sec}"
+
                 c.execute('SELECT id FROM students WHERE LOWER(TRIM(username)) = LOWER(TRIM(?))', (uname,))
                 row = c.fetchone()
 
@@ -710,12 +989,12 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                     if overwrite:
                         c.execute('''
                             UPDATE students SET
-                                nationalId = ?, phone = ?, gradeSection = ?, notes = ?,
+                                nationalId = ?, phone = ?, grade = ?, section = ?, gradeSection = ?, notes = ?,
                                 exam1Score = ?, exam2Score = ?, participationScore = ?, bonusScore = ?,
                                 showGradesToStudent = ?, showNotesToStudent = ?
                             WHERE id = ?
                         ''', (
-                            s.get('nationalId', ''), s.get('phone', ''), s.get('gradeSection', ''), s.get('notes', ''),
+                            s.get('nationalId', ''), s.get('phone', ''), gr, sec, gr_sec, s.get('notes', ''),
                             s.get('exam1Score', 0.0), s.get('exam2Score', 0.0), s.get('participationScore', 0.0), s.get('bonusScore', 0.0),
                             s.get('showGradesToStudent', 1), s.get('showNotesToStudent', 1),
                             row[0]
@@ -723,10 +1002,10 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
                         updated += 1
                 else:
                     c.execute('''
-                        INSERT INTO students (username, nationalId, phone, gradeSection, password, notes, exam1Score, exam2Score, participationScore, bonusScore, showGradesToStudent, showNotesToStudent, createdAt)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO students (username, nationalId, phone, grade, section, gradeSection, password, notes, exam1Score, exam2Score, participationScore, bonusScore, showGradesToStudent, showNotesToStudent, createdAt)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        uname, s.get('nationalId', ''), s.get('phone', ''), s.get('gradeSection', ''),
+                        uname, s.get('nationalId', ''), s.get('phone', ''), gr, sec, gr_sec,
                         s.get('password', '123456'), s.get('notes', ''),
                         s.get('exam1Score', 0.0), s.get('exam2Score', 0.0), s.get('participationScore', 0.0), s.get('bonusScore', 0.0),
                         s.get('showGradesToStudent', 1), s.get('showNotesToStudent', 1),
@@ -740,7 +1019,7 @@ class ClassroomHandler(http.server.BaseHTTPRequestHandler):
             self.send_json(200, {"success": True, "added": added, "updated": updated})
             return
 
-        # 14. POST /api/teacher/clear-logs
+        # 17. POST /api/teacher/clear-logs
         if path == '/api/teacher/clear-logs':
             conn = sqlite3.connect(DB_FILE)
             c = conn.cursor()
